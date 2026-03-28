@@ -12,13 +12,14 @@ def hitung_total_desibel(daftar_db):
     
     # Langkah 2: Jumlahkan semua energi linear tersebut
     total_energi = np.sum(energi_linear)
-    
+    #total_energi = (np.sum(energi_linear))/60 kalau mau hitung tiap menit
+
     # Mencegah error matematika (logaritma dari nol) jika array kosong atau bernilai minus tak terhingga
     if total_energi <= 1e-10:
         return 0.0
         
     # Ubah kembali total energi linear ke skala logaritmik (dB)
-    total_db = 10 * np.log10(total_energi)
+    total_db = (10 * np.log10(total_energi))
     
     return total_db
 
