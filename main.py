@@ -471,7 +471,8 @@ def publisher_process(
         # --- Print terminal ---
         unit_label = "minute" if mode == 'minute' else "second"
         print(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit_label})")
-
+        logger.info(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit_label})")
+        
         # --- Plot hanya yang di request aja (cek berdasarkan total second, konsisten di kedua mode) ---
         sec = result['second']
         if sec in plot_seconds_set and sec not in plotted_seconds:
