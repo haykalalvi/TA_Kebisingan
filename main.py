@@ -21,6 +21,8 @@ import matplotlib
 matplotlib.use('Agg') # WAJIB: supaya matplotlib engga buka GUI dari background process. jadi ga ngelag
 import matplotlib.pyplot as plt
 import gc
+import paho.mqtt.client as mqtt
+import json
 
 # ===================== CONFIGURATION =====================
 UART_PORT = '/dev/ttyACM0'
@@ -43,6 +45,10 @@ MIC_BITS = 24
 MIC_REF_AMPL = pow(10, MIC_SENSITIVITY / 20) * ((1 << (MIC_BITS - 1)) - 1)
 
 WEIGHTING = 'Z'  # Opsi: 'A', 'C', 'Z'
+
+MQTT_HOST = 'localhost'
+MQTT_PORT = 1883
+MQTT_TOPIC = "kebisingan/Leq"
 
 # ===================== DISPLAY MODE =====================
 DISPLAY_MODE = 'minute'  # Opsi: 'second' atau 'minute'
@@ -113,6 +119,7 @@ class RingBuffer:
             return None
         if self.head + length <= self.capacity:
             return bytes(self.buffer[self.head:self.head + length])
+        #else :
         first_part = self.capacity - self.head
         return bytes(self.buffer[self.head:]) + bytes(self.buffer[:length - first_part])
 
@@ -382,6 +389,8 @@ def octave_leq_analyzer_process(
 
                     # --- Leq 1 menit total (dari 60 nilai leq_total_raw) ---
                     # Shape input: (60,) → output: scalar
+                    # kenapa yang dipake minute_buffer_total, padahal ini isinya leq total per detik
+                    # kenapa ga cari leq total 1 menit dari leq_1min_bands??
                     leq_1min_total_raw = float(
                         _leq_average(minute_buffer_total, SECONDS_PER_MINUTE)
                     )
@@ -389,6 +398,7 @@ def octave_leq_analyzer_process(
                     # --- Leq 1 menit total weighted (dari 60 nilai leq_total_weighted) ---
                     # Hitung ulang leq_total_weighted per detik dari buffer bands raw + weighting
                     # total = penjumlahan logaritmik dari 31 band weighted
+                    # ini kenapa ga pake leq_1min_bands_weighted buat dijumlahin logaritmik??
                     leq_1min_total_weighted_val = float(
                         _leq_average(
                             np.array([
@@ -447,6 +457,15 @@ def publisher_process(
     logger = logging.getLogger()
     logger.info("Publisher Process started")
 
+    try:
+        client = mqtt.Client()
+        client.connect(MQTT_HOST, MQTT_PORT, 60)
+        client.loop_start()
+        logger.info(f"Connected to MQTT")
+    except Exception as e:
+        logger.error(f"Failed connecting to MQTT: {e}")
+        client = None
+
     plotted_seconds = set()
     plot_seconds_set = set(plot_seconds)
 
@@ -455,6 +474,12 @@ def publisher_process(
         "250", "315", "400", "500", "630", "800", "1k", "1.25k", "1.6k", "2k",
         "2.5k", "3.15k", "4k", "5k", "6.3k", "8k", "10k", "12.5k", "16k", "20k"
     ]
+
+    list_frekuensi = ["freq_00020", "freq_00025", "freq_00031_5", "freq_00040",
+                  "freq_00050", "freq_00063", "freq_00080", "freq_00100", "freq_00125", "freq_00160", "freq_00200",
+                  "freq_00250", "freq_00315", "freq_00400", "freq_00500", "freq_00630", "freq_00800", "freq_01000",
+                  "freq_01250", "freq_01600", "freq_02000", "freq_02500", "freq_03150", "freq_04000", "freq_05000",
+                  "freq_06300", "freq_08000", "freq_10000", "freq_12500", "freq_16000", "freq_20000"] 
 
     while not stop_event.is_set():
         try:
@@ -468,11 +493,21 @@ def publisher_process(
         label = result['label']
         mode = result['display_mode']
 
+        data_kebisingan = {}
+        data_kebisingan['device_id'] = "dev_001"
+        data_kebisingan['leq_total_weighted'] = result['leq_total_weighted']
+        data_kebisingan['leq_total'] = result['leq_total_raw']
+        data_kebisingan['lat'] = result['lat']
+        data_kebisingan['lon'] = result['lon']
+        for i in range(len(list_frekuensi)): 
+            data_kebisingan[f'raw_{list_frekuensi[i]}'] = result['leq_bands_raw'][i]
+            data_kebisingan[f'weight_{list_frekuensi[i]}'] = result['leq_bands_weighted'][i]
+
         # --- Print terminal ---
         unit_label = "minute" if mode == 'minute' else "second"
         print(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit_label})")
         logger.info(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit_label})")
-        
+
         # --- Plot hanya yang di request aja (cek berdasarkan total second, konsisten di kedua mode) ---
         sec = result['second']
         if sec in plot_seconds_set and sec not in plotted_seconds:
@@ -481,6 +516,17 @@ def publisher_process(
 
         # --- MQTT publish (uncomment aje kalau udah mau dipake) ---
         # _publish_mqtt(result)
+        if client:
+            try:
+                payload = json.dumps(data_kebisingan)
+                client.publish(MQTT_TOPIC, payload, 1)
+            except Exception as e:
+                logger.error(f"Failed to transmit data: {e}")
+        
+    if client:
+        client.loop_stop()
+        client.disconnect()
+        logger.info("MQTT Disconnected")
 
     logger.info("Publisher Process stopped.")
 
