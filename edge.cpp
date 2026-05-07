@@ -1,71 +1,32 @@
 /**
  * =============================================================================
- * ESP32-S3
+ * ESP32-S3 (Super-Loop / Single Core Architecture)
  * Audio Streaming + GPS + Calibration + INA219 Battery Monitor
  * =============================================================================
  *
- * ARCHITECTURE:
- *   Core 1 — audioDSPTask (highest priority)
- *     • i2s_read → MIC_CONVERT → DC_BLOCKER → INMP441 EQ → audioQueue
- *     • Runs unconditionally. No shared state reads.
- *
- *   Core 0 — systemTask (priority 1)
- *     • USB CDC binary streaming is ALWAYS active regardless of mode.
- *       The gain (calibration_multiplier) packed in each frame header updates
- *       in real-time as the user presses buttons — Pi sees the new gain within
- *       one frame (125 ms). This lets the user hear/see the effect of gain
- *       changes on the Pi's dB readout immediately.
- *     • DeviceMode only controls:
- *         - Whether UP/DOWN buttons adjust the gain (CALIBRATING only)
- *         - Which data the LCD shows (battery vs gain)
- *     • ALL Serial.printf / Serial.println are permanently suppressed.
- *       Because streaming never pauses, any text byte in the CDC stream
- *       would corrupt the binary framing on the Pi side.
- *     • Reads INA219 (voltage, current, mAh) every 1 s — non-blocking timer
- *     • Reads GPS UART
- *     • Handles buttons (UP/DOWN/hold-both) for calibration mode toggle
- *
- * USB PACKET LAYOUT (little-endian, packed):
- *   [0x AA55AA55] start marker       4 B
- *   timestamp_ms                     4 B  (uint32)
- *   latitude                         4 B  (float)
- *   longitude                        4 B  (float)
- *   calibration_multiplier           4 B  (float)  ← Pi applies gain here
- *   battery_percentage               4 B  (float)  ← NEW field
- *   samples[SAMPLES_SHORT]       24000 B  (float[6000])
- *   [0x 55AA55AA] end marker         4 B
- *   TOTAL                        24028 B
- *
- * NOTE FOR RASPBERRY PI:
- *   HEADER_FMT  = '<II4f'        (start, ts, lat, lon, calib, batt)
- *   HEADER_SIZE = 24 bytes
- *   FRAME_SIZE  = 24 + 24000 + 4 = 24028 bytes
- *   Update noise_monitor.py accordingly.
- *
- * LCD OWNERSHIP:
- *   STREAMING mode  → row 0: voltage + current   row 1: battery % + mAh used
- *   CALIBRATING mode → row 0: "MODE: KALIBRASI"  row 1: gain value
- *   Mode transition clears the screen to avoid ghost text.
+ * ARCHITECTURE CHANGES:
+ *   • Removed FreeRTOS tasks (audioDSPTask, systemTask), Queues, and Mutexes.
+ *   • Removed atomic variables (no longer needed for single-thread).
+ *   • Everything runs synchronously in the main Arduino loop().
+ *   • I2S reads directly, processes, checks system state, and writes to USB sequentially.
  * =============================================================================
  */
 
 #include <HardwareSerial.h>
-#include <TinyGPSPlus.h>
+#include <TinyGPS++.h>
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <Preferences.h>
-#include <atomic>
 #include "sos-iir-filter.h"
 
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 
 /* ─── I2C ────────────────────────────────────────────────────────────────── */
-// only called once. Do NOT call Wire.begin() more than once.
-#define I2C_SDA 4 //8
-#define I2C_SCL 5 //9
+#define I2C_SDA 4 
+#define I2C_SCL 5 
 
-Adafruit_INA219    ina219;            // default address 0x40
+Adafruit_INA219 ina219;            
 
 /* ─── AUDIO CONFIG ───────────────────────────────────────────────────────── */
 #define SAMPLE_RATE    48000
@@ -94,10 +55,10 @@ Adafruit_INA219    ina219;            // default address 0x40
 #define BTN_DOWN 10
 
 /* ─── TIMING ─────────────────────────────────────────────────────────────── */
-#define HOLD_DURATION_MS    2000   // hold both buttons to toggle mode
-#define NVS_SAVE_DELAY_MS   8000   // min ms between NVS writes
-#define SAVE_NOTIFY_MS      1500   // "Tersimpan!" display duration
-#define BATTERY_INTERVAL_MS 1000   // INA219 sample interval
+#define HOLD_DURATION_MS    2000   
+#define NVS_SAVE_DELAY_MS   8000   
+#define SAVE_NOTIFY_MS      1500   
+#define BATTERY_INTERVAL_MS 1000   
 
 /* ─── BATTERY SPEC (3S LiPo 12 V nominal) ───────────────────────────────── */
 #define BATT_V_MAX  12.6f
@@ -112,14 +73,13 @@ enum class DeviceMode : uint8_t {
 /* ═══════════════════════════════════════════════════════════════════════════
    GLOBALS
    ═══════════════════════════════════════════════════════════════════════════ */
-HardwareSerial gpsSerial(1);
 TinyGPSPlus    gps;
+HardwareSerial gpsSerial(1);
 Preferences    preferences;
 
-/* --- Atomic shared state -------------------------------------------------- */
-// Only systemTask writes these; audioDSPTask never reads either of them.
-std::atomic<uint8_t> deviceMode(static_cast<uint8_t>(DeviceMode::STREAMING));
-std::atomic<float>   currentCalibration(1.0f);
+// Single-thread state variables
+DeviceMode deviceMode = DeviceMode::STREAMING;
+float      currentCalibration = 1.0f;
 
 /* --- USB packet ----------------------------------------------------------- */
 typedef struct __attribute__((packed)) {
@@ -131,18 +91,12 @@ typedef struct __attribute__((packed)) {
     float    samples[SAMPLES_SHORT];
 } usb_packet_t;
 
-static usb_packet_t      usb_packet;
-static SemaphoreHandle_t packetMutex = nullptr;
+static usb_packet_t usb_packet;
 
-/* --- Audio double-buffer + queue ----------------------------------------- */
-static float         audio_buffers[2][SAMPLES_SHORT] __attribute__((aligned(4)));
-static QueueHandle_t audioQueue = nullptr;
-
-/* --- Diagnostics ---------------------------------------------------------- */
-static std::atomic<uint32_t> droppedFrames(0);
+// Raw buffer for I2S read
+static int32_t raw_i2s_buffer[SAMPLES_SHORT] __attribute__((aligned(4)));
 
 /* ─── IIR FILTERS ────────────────────────────────────────────────────────── */
-// Coefficients must match the specific INMP441 unit used.
 SOS_IIR_Filter DC_BLOCKER = {
     1.0,
     { {-1.0, 0.0, 0.9992, 0} }
@@ -180,248 +134,16 @@ void mic_i2s_init() {
     i2s_set_pin(I2S_PORT, &pins);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
-   TASK: audioDSPTask  (Core 1, max priority)
-
-   Pure acquisition: i2s_read → convert → DC block → EQ → queue.
-   Zero shared-state reads. Gain is NOT applied — Pi does that.
-   ═══════════════════════════════════════════════════════════════════════════ */
-void audioDSPTask(void *) {
-    int buf = 0;
-    while (true) {
-        size_t bytes_read = 0;
-        i2s_read(I2S_PORT,
-                 audio_buffers[buf],
-                 SAMPLES_SHORT * sizeof(int32_t),
-                 &bytes_read,
-                 portMAX_DELAY);
-
-        // In-place int32 → float conversion
-        int32_t *raw = reinterpret_cast<int32_t *>(audio_buffers[buf]);
-        for (int i = 0; i < SAMPLES_SHORT; i++) {
-            audio_buffers[buf][i] = static_cast<float>(MIC_CONVERT(raw[i]));
-        }
-
-        DC_BLOCKER.filter(audio_buffers[buf], audio_buffers[buf], SAMPLES_SHORT);
-        INMP441.filter   (audio_buffers[buf], audio_buffers[buf], SAMPLES_SHORT);
-
-        // Offer buffer index to systemTask. Timeout = 0 to never block DMA.
-        if (xQueueSend(audioQueue, &buf, 0) != pdPASS) {
-            droppedFrames.fetch_add(1, std::memory_order_relaxed);
-        }
-        buf ^= 1;
-    }
-}
-
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   TASK: systemTask  (Core 0, priority 1)
-
-   USB CDC streaming is ALWAYS active. DeviceMode only determines:
-     STREAMING   → LCD shows battery | buttons do NOT change gain
-     CALIBRATING → LCD shows gain    | buttons DO change gain
-                                       gain update visible on Pi within 125 ms
-
-   IMPORTANT: Serial.printf / Serial.println are completely suppressed here.
-   Since streaming never stops, any text byte written to Serial would appear
-   inside the binary frame stream and corrupt the Pi's frame parser.
-   ═══════════════════════════════════════════════════════════════════════════ */
-void systemTask(void *) {
-
-    // ── Local copies ─────────────────────────────────────────────────────
-    float localCalibration = currentCalibration.load();
-
-    // ── Battery state (all local to this task — no sharing needed) ───────
-    float         battVoltage    = 0.0f;
-    float         battCurrent_mA = 0.0f;
-    float         battPercent    = 0.0f;
-    float         mAh_used       = 0.0f;
-    unsigned long battLastMs     = millis();
-
-    // ── Button state ──────────────────────────────────────────────────────
-    bool          lastUp   = HIGH;
-    bool          lastDown = HIGH;
-    unsigned long bothPressStart = 0;
-    bool          holdFired      = false;
-
-    // ── NVS deferred save ─────────────────────────────────────────────────
-    bool          calibChanged = false;
-    unsigned long lastSaveMs   = 0;
-
-    // ── Non-blocking LCD "Tersimpan!" notify ──────────────────────────────
-    unsigned long saveNotifyEnd = 0;
-
-    while (true) {
-        unsigned long now = millis();
-        bool upPressed    = (digitalRead(BTN_UP)   == LOW);
-        bool downPressed  = (digitalRead(BTN_DOWN) == LOW);
-        bool isCalib      = (static_cast<DeviceMode>(deviceMode.load())
-                             == DeviceMode::CALIBRATING);
-
-        /* ════════════════════════════════════════════════════════════════
-           BATTERY MONITOR — runs every BATTERY_INTERVAL_MS
-           Non-blocking: uses elapsed-time check, never delays.
-           Only updates LCD when in STREAMING mode so calibration display
-           is not clobbered.
-           ════════════════════════════════════════════════════════════════ */
-        if (now - battLastMs >= BATTERY_INTERVAL_MS) {
-            unsigned long elapsed_ms = now - battLastMs;
-            battLastMs = now;
-            
-            // if want to use real data from ina
-            // battVoltage    = ina219.getBusVoltage_V();
-            // battCurrent_mA = ina219.getCurrent_mA();
-
-            // if want to use dummy data (e.g., a healthy 11.4V drawing 250mA)
-            battVoltage    = 11.4f;  
-            battCurrent_mA = 250.0f;
-
-            // Coulomb counting: mAh += mA * hours
-            mAh_used += battCurrent_mA * (elapsed_ms / 3600000.0f);
-
-            // Linear voltage → percentage mapping, clamped 0–100 %
-            battPercent = ((battVoltage - BATT_V_MIN) / (BATT_V_MAX - BATT_V_MIN)) * 100.0f;
-            if (battPercent > 100.0f) battPercent = 100.0f;
-            if (battPercent < 0.0f)   battPercent = 0.0f;
-
-            // Only update LCD if we own it (STREAMING mode)
-        }
-
-        /* ════════════════════════════════════════════════════════════════
-           HOLD-BOTH-BUTTONS → toggle STREAMING ↔ CALIBRATING
-           ════════════════════════════════════════════════════════════════ */
-        if (upPressed && downPressed) {
-            if (bothPressStart == 0) {
-                bothPressStart = now;
-                holdFired      = false;
-            } else if (!holdFired && (now - bothPressStart >= HOLD_DURATION_MS)) {
-                holdFired = true;
-
-                if (!isCalib) {
-                    // ── Enter CALIBRATING ──────────────────────────────
-                    deviceMode.store(static_cast<uint8_t>(DeviceMode::CALIBRATING));
-                    isCalib = true;
-
-
-                } else {
-                    // ── Exit CALIBRATING → STREAMING ──────────────────
-                    deviceMode.store(static_cast<uint8_t>(DeviceMode::STREAMING));
-                    isCalib = false;
-                }
-            }
+// Safety function to send dta
+void send_all_bytes(uint8_t* data, size_t total_length) {
+    size_t bytes_written = 0;
+    while (bytes_written < total_length) {
+        size_t w = Serial.write(data + bytes_written, total_length - bytes_written);
+        if (w == 0) {
+            delay(1); 
         } else {
-            bothPressStart = 0;
-            holdFired      = false;
+            bytes_written += w;
         }
-
-        /* ════════════════════════════════════════════════════════════════
-           SINGLE-BUTTON EDGE DETECTION
-           Only processed in CALIBRATING mode
-           ════════════════════════════════════════════════════════════════ */
-        if (isCalib) {
-
-            // if we want to use rising edge
-            // bool upEdge   = (!lastUp   && upPressed);
-            // bool downEdge = (!lastDown && downPressed);
-
-            /* Falling edge: button was LOW (pressed) last tick, HIGH (released) now */
-            bool upEdge   = (lastUp   == LOW && !upPressed);
-            bool downEdge = (lastDown == LOW && !downPressed);
-
-            if (upEdge && !downPressed) {
-                localCalibration += 0.25f;
-                currentCalibration.store(localCalibration);
-                calibChanged  = true;
-                saveNotifyEnd = 0;
-                // No Serial.printf — would corrupt binary stream
-            }
-
-            if (downEdge && !upPressed) {
-                localCalibration -= 0.25f;
-                if (localCalibration < 0.0f) localCalibration = 0.0f;
-                currentCalibration.store(localCalibration);
-                calibChanged  = true;
-                saveNotifyEnd = 0;
-            }
-        }
-
-        lastUp   = upPressed   ? LOW : HIGH;
-        lastDown = downPressed ? LOW : HIGH;
-
-        /* ════════════════════════════════════════════════════════════════
-           NVS DEFERRED SAVE
-           ════════════════════════════════════════════════════════════════ */
-        if (calibChanged && (now - lastSaveMs >= NVS_SAVE_DELAY_MS)) {
-            preferences.putFloat("multiplier", localCalibration);
-            calibChanged = false;
-            lastSaveMs   = now;
-            // No Serial.printf — would corrupt binary stream
-
-            if (isCalib) {
-                saveNotifyEnd = now + SAVE_NOTIFY_MS;
-            }
-        }
-
-        /* ════════════════════════════════════════════════════════════════
-           NON-BLOCKING "Tersimpan!" NOTIFY EXPIRY
-           ════════════════════════════════════════════════════════════════ */
-        if (saveNotifyEnd != 0 && now >= saveNotifyEnd) {
-            saveNotifyEnd = 0;
-        }
-
-        /* ════════════════════════════════════════════════════════════════
-           GPS FEED
-           ════════════════════════════════════════════════════════════════ */
-        while (gpsSerial.available()) {
-            gps.encode(gpsSerial.read());
-        }
-
-        /* ════════════════════════════════════════════════════════════════
-           AUDIO FRAME → USB CDC  (ALWAYS — both modes)
-
-           localCalibration is updated in-place by the button handler above,
-           within this same task and same core. By the time we reach this
-           block, localCalibration already holds the newest value — no race
-           is possible because both writes and reads happen sequentially in
-           systemTask on Core 0.
-
-           The Pi receives the updated gain in the header of the very next
-           frame (≤125 ms after the button press), giving real-time feedback
-           on how gain changes affect the dB readout.
-           ════════════════════════════════════════════════════════════════ */
-        int ready_buf = -1;
-        if (xQueueReceive(audioQueue, &ready_buf, pdMS_TO_TICKS(5)) == pdPASS) {
-            if (xSemaphoreTake(packetMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                usb_packet.timestamp_ms           = now;
-                usb_packet.latitude               = gps.location.lat();
-                usb_packet.longitude              = gps.location.lng();
-                usb_packet.calibration_multiplier = localCalibration;
-                usb_packet.battery_percentage     = battPercent;
-
-                memcpy(usb_packet.samples,
-                       audio_buffers[ready_buf],
-                       SAMPLES_SHORT * sizeof(float));
-
-                uint32_t sm = FRAME_START_MARKER;
-                uint32_t em = FRAME_END_MARKER;
-                Serial.write(reinterpret_cast<uint8_t *>(&sm), 4);
-                Serial.write(reinterpret_cast<uint8_t *>(&usb_packet), sizeof(usb_packet_t));
-                Serial.write(reinterpret_cast<uint8_t *>(&em), 4);
-
-                xSemaphoreGive(packetMutex);
-            }
-        }
-
-        /* ════════════════════════════════════════════════════════════════
-           DROP COUNTER — tracked silently.
-           Serial.printf is completely suppressed because streaming never
-           pauses and any text byte would corrupt the Pi's frame parser.
-           Read droppedFrames via a debugger or JTAG if needed.
-           ════════════════════════════════════════════════════════════════ */
-        // droppedFrames.load() is available for debugger inspection if needed.
-
-        vTaskDelay(1);
     }
 }
 
@@ -429,65 +151,157 @@ void systemTask(void *) {
    SETUP
    ═══════════════════════════════════════════════════════════════════════════ */
 void setup() {
+    Serial.setTxBufferSize(32768); 
     Serial.begin(115200);
     setCpuFrequencyMhz(240);
 
-    /* ── I2C bus (INA219) ──────────────────────────────── */
     Wire.begin(I2C_SDA, I2C_SCL);
-
-    /* ── INA219 ─────────────────────────────────────────────────────────── */
     if (!ina219.begin()) {
-
-        // We give this if we use real data
-        // Halt — no point continuing without battery monitoring
-        // while (true) { vTaskDelay(pdMS_TO_TICKS(100)); }
-
-        // we print this if we use data dummy for ina 219
-        Serial.println("SIMULATION MODE: INA219 Not Found. Using fake data.");
+        // Serial.println("INA219 Not Found.");
     }
 
-    /* ── Buttons ─────────────────────────────────────────────────────────── */
     pinMode(BTN_UP,   INPUT_PULLUP);
     pinMode(BTN_DOWN, INPUT_PULLUP);
 
-    /* ── NVS calibration restore ─────────────────────────────────────────── */
     preferences.begin("audio-calib", false);
-    float saved = preferences.getFloat("multiplier", 1.0f);
-    currentCalibration.store(saved);
+    currentCalibration = preferences.getFloat("multiplier", 1.0f);
 
-    /* ── I2S mic ─────────────────────────────────────────────────────────── */
     mic_i2s_init();
-
-    /* ── GPS UART ────────────────────────────────────────────────────────── */
     gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
-
-    /* ── RTOS primitives ─────────────────────────────────────────────────── */
-    audioQueue = xQueueCreate(8, sizeof(int));
-    configASSERT(audioQueue);
-
-    packetMutex = xSemaphoreCreateMutex();
-    configASSERT(packetMutex);
-
-    /* ── Splash delay ────────────────────────────────────────────────────── */
-    delay(1500);
-    // lcd.clear();
-
-    /* ── Tasks ───────────────────────────────────────────────────────────── */
-    // audioDSPTask: Core 1, max priority — must never be starved so DMA
-    // hardware does not overflow between reads.
-    xTaskCreatePinnedToCore(
-        audioDSPTask, "AudioDSP",
-        10240, NULL, configMAX_PRIORITIES - 1, NULL, 1
-    );
-
-    // systemTask: Core 0, priority 1 — all user-facing and I/O work.
-    // Lower priority than audioDSPTask is intentional.
-    xTaskCreatePinnedToCore(
-        systemTask, "SystemTask",
-        12288, NULL, 1, NULL, 0   // 12 KB: larger for INA219 + LCD printf
-    );
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   MAIN LOOP (Synchronous Super-Loop)
+   ═══════════════════════════════════════════════════════════════════════════ */
 void loop() {
-    vTaskDelete(NULL);
+    static float         battVoltage    = 0.0f;
+    static float         battCurrent_mA = 0.0f;
+    static float         battPercent    = 0.0f;
+    static float         mAh_used       = 0.0f;
+    static unsigned long battLastMs     = millis();
+
+    static bool          lastUp         = HIGH;
+    static bool          lastDown       = HIGH;
+    static unsigned long bothPressStart = 0;
+    static bool          holdFired      = false;
+
+    static bool          calibChanged   = false;
+    static unsigned long lastSaveMs     = 0;
+    static unsigned long saveNotifyEnd  = 0;
+
+    unsigned long now = millis();
+
+    // =========================================================================
+    // 1. AUDIO ACQUISITION & DSP (Blocks until 125ms of data is ready)
+    // =========================================================================
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, raw_i2s_buffer, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+    // Convert directly into the USB packet struct to save memory
+    for (int i = 0; i < SAMPLES_SHORT; i++) {
+        usb_packet.samples[i] = static_cast<float>(MIC_CONVERT(raw_i2s_buffer[i]));
+    }
+
+    DC_BLOCKER.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+    INMP441.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+
+    // =========================================================================
+    // 2. SYSTEM LOGIC (Battery, Buttons, GPS, NVS)
+    // =========================================================================
+    
+    // -- Battery Monitor --
+    if (now - battLastMs >= BATTERY_INTERVAL_MS) {
+        unsigned long elapsed_ms = now - battLastMs;
+        battLastMs = now;
+        
+        battVoltage    = ina219.getBusVoltage_V();
+        battCurrent_mA = ina219.getCurrent_mA();
+        mAh_used      += battCurrent_mA * (elapsed_ms / 3600000.0f);
+
+        // Dummy data options (e.g., a healthy 11.4V drawing 250mA)
+        //battVoltage    = 11.4f;  
+        //battCurrent_mA = 250.0f;
+
+        battPercent = ((battVoltage - BATT_V_MIN) / (BATT_V_MAX - BATT_V_MIN)) * 100.0f;
+        if (battPercent > 100.0f) battPercent = 100.0f;
+        if (battPercent < 0.0f)   battPercent = 0.0f;
+    }
+
+    // -- Button State --
+    bool upPressed    = (digitalRead(BTN_UP)   == LOW);
+    bool downPressed  = (digitalRead(BTN_DOWN) == LOW);
+    bool isCalib      = (deviceMode == DeviceMode::CALIBRATING);
+
+    // Hold both buttons
+    if (upPressed && downPressed) {
+        if (bothPressStart == 0) {
+            bothPressStart = now;
+            holdFired      = false;
+        } else if (!holdFired && (now - bothPressStart >= HOLD_DURATION_MS)) {
+            holdFired = true;
+            deviceMode = isCalib ? DeviceMode::STREAMING : DeviceMode::CALIBRATING;
+            isCalib = (deviceMode == DeviceMode::CALIBRATING);
+        }
+    } else {
+        bothPressStart = 0;
+        holdFired      = false;
+    }
+
+    // Single edge detection for Calibration
+    if (isCalib) {
+        bool upEdge   = (lastUp   == LOW && !upPressed);
+        bool downEdge = (lastDown == LOW && !downPressed);
+
+        if (upEdge && !downPressed) {
+            currentCalibration += 0.25f;
+            calibChanged  = true;
+            saveNotifyEnd = 0;
+        }
+        if (downEdge && !upPressed) {
+            currentCalibration -= 0.25f;
+            if (currentCalibration < 0.0f) currentCalibration = 0.0f;
+            calibChanged  = true;
+            saveNotifyEnd = 0;
+        }
+    }
+    lastUp   = upPressed   ? LOW : HIGH;
+    lastDown = downPressed ? LOW : HIGH;
+
+    // -- NVS Save --
+    if (calibChanged && (now - lastSaveMs >= NVS_SAVE_DELAY_MS)) {
+        preferences.putFloat("multiplier", currentCalibration);
+        calibChanged = false;
+        lastSaveMs   = now;
+        if (isCalib) saveNotifyEnd = now + SAVE_NOTIFY_MS;
+    }
+
+    if (saveNotifyEnd != 0 && now >= saveNotifyEnd) {
+        saveNotifyEnd = 0;
+    }
+
+    // -- GPS Feed --
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+    }
+
+    // =========================================================================
+    // 3. USB CDC STREAMING
+    // =========================================================================
+    usb_packet.timestamp_ms           = now;
+    usb_packet.latitude               = gps.location.lat();
+    usb_packet.longitude              = gps.location.lng();
+    usb_packet.calibration_multiplier = currentCalibration;
+    usb_packet.battery_percentage     = battPercent;
+
+    uint32_t sm = FRAME_START_MARKER;
+    uint32_t em = FRAME_END_MARKER;
+    
+    Serial.write(reinterpret_cast<uint8_t *>(&sm), 4);
+    Serial.write(reinterpret_cast<uint8_t *>(&usb_packet), sizeof(usb_packet_t));
+    Serial.write(reinterpret_cast<uint8_t *>(&em), 4);
+
+    // Opsi makai fungsi send all bytes (safety option)
+    // send_all_bytes(reinterpret_cast<uint8_t*>(&sm), 4);
+    // send_all_bytes(reinterpret_cast<uint8_t*>(&usb_packet), sizeof(usb_packet_t));
+    // send_all_bytes(reinterpret_cast<uint8_t*>(&em), 4);
 }
