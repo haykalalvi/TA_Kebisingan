@@ -59,7 +59,9 @@ MIC_OFFSET_DB      = 3.0103
 MIC_BITS           = 24
 MIC_REF_AMPL       = pow(10, MIC_SENSITIVITY / 20) * ((1 << (MIC_BITS - 1)) - 1)
 
-WEIGHTING          = 'Z'   # 'A', 'C', or 'Z'
+WEIGHTING_Z          = 'Z'   # 'A', 'C', or 'Z'
+WEIGHTING_A          = 'A'
+WEIGHTING_C          = 'C'
 
 # ===================== DISPLAY MODE =====================
 DISPLAY_MODE       = 'second'   # 'second' or 'minute'
@@ -95,7 +97,7 @@ PLOT_SECONDS_RAW = [10, 20]
 
 MQTT_HOST = 'localhost'
 MQTT_PORT = 1883
-MQTT_TOPIC = "kebisingan/Leq"
+MQTT_TOPIC = "kebisingan/alat1"
 
 def _resolve_plot_seconds(plot_seconds, display_mode, secs_per_min):
     """
@@ -130,12 +132,12 @@ C_WEIGHTING_CORRECTIONS = np.array([
      0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
      0.0,  0.0,  0.0, -0.1, -0.2, -0.3, -0.5, -0.8, -1.3, -2.0, -3.0
 ])
-Z_WEIGHTING_CORRECTIONS = np.zeros(31)
+#Z_WEIGHTING_CORRECTIONS = np.zeros(31)
 
 WEIGHTING_DICT = {
     'A': A_WEIGHTING_CORRECTIONS,
     'C': C_WEIGHTING_CORRECTIONS,
-    'Z': Z_WEIGHTING_CORRECTIONS,
+    #'Z': Z_WEIGHTING_CORRECTIONS,
 }
 
 
@@ -186,13 +188,17 @@ class RingBuffer:
         if self.head < self.tail:
             data = self.buffer[self.head:self.tail]
         else:
+            # data = bytearray(self.size) #optimize 2
+            # first_part = self.capacity - self.head
+            # data[:first_part] = self.buffer[self.head:self.capacity]
+            # data[first_part:] = self.buffer[0:self.tail] 
             data = bytes(self.buffer[self.head:]) + bytes(self.buffer[:self.tail])
         idx = data.find(pattern)
+        # idx = bytes(data).find(pattern)
         return idx if idx != -1 else -1
 
     def __len__(self):
         return self.size
-
 
 # ===================== PROCESS 1: SERIAL READER =====================
 def serial_reader_process(
@@ -222,13 +228,26 @@ def serial_reader_process(
     start_marker_bytes = struct.pack('<I', FRAME_START_MARKER)
 
     try:
-        ser = serial.Serial(UART_PORT, UART_BAUD, timeout=0.05)
+        ser = serial.Serial(UART_PORT, UART_BAUD, timeout=0) #optimize delay 1
         logger.info(f"Serial opened: {UART_PORT} @ {UART_BAUD} baud | frame={FRAME_SIZE}B")
 
         while not stop_event.is_set():
-            if ser.in_waiting > 0:
-                chunk = ser.read(max(ser.in_waiting, 8192))
+
+            # bytes_waiting = ser.in_waiting
+            # if bytes_waiting > 0:
+            #     chunk = ser.read(bytes_waiting)
+            #     buffer.extend(chunk)
+            # if ser.in_waiting > 0:
+            #    chunk = ser.read(max(ser.in_waiting, 8192))
+            #    buffer.extend(chunk)
+            
+            chunk = ser.read(8192)
+            if chunk:
                 buffer.extend(chunk)
+
+            else: #optimize delay 1
+                time.sleep(0.001)
+                continue
 
             while len(buffer) >= FRAME_SIZE:
                 # ── Step 1: ensure buffer head is a start marker ──────────
@@ -252,7 +271,8 @@ def serial_reader_process(
                 if end_marker != FRAME_END_MARKER:
                     with stat_pkt_corrupted.get_lock():
                         stat_pkt_corrupted.value += 1
-                    buffer.consume(FRAME_SIZE)
+                    #buffer.consume(FRAME_SIZE)
+                    buffer.consume(1) # optimize 1
                     continue
 
                 # ── Step 4: parse header (20 bytes) ──────────────────────
@@ -267,9 +287,10 @@ def serial_reader_process(
                     # ── Step 5: extract raw samples (no gain applied here) ─
                     samples_end  = HEADER_SIZE + SAMPLES_SHORT * 4
                     raw_samples  = np.frombuffer(
-                        frame_bytes[HEADER_SIZE:samples_end], dtype=np.float32
+                       frame_bytes[HEADER_SIZE:samples_end], dtype=np.float32
                     ).copy()   # .copy() required: frame_bytes is a temporary bytes object
 
+                    #raw_samples_bytes = bytes(frame_bytes[HEADER_SIZE:samples_end]) # optimize delay 2
                     packet = {
                         'raw_samples': raw_samples,   # untouched sensor data
                         'calib':       float(calib),  # gain for analyzer to apply
@@ -280,9 +301,11 @@ def serial_reader_process(
 
                     try:
                         raw_queue.put_nowait(packet)
+                        #raw_queue.put(packet, block=True, timeout=0.05) #optimize 4
                         with stat_pkt_received.get_lock():
                             stat_pkt_received.value += 1
                     except Exception:
+                    #except queue.full:
                         # Queue full → analyzer is behind → drop this packet
                         with stat_pkt_dropped.get_lock():
                             stat_pkt_dropped.value += 1
@@ -299,6 +322,7 @@ def serial_reader_process(
         if 'ser' in locals() and ser.is_open:
             ser.close()
         logger.info("Serial Reader stopped.")
+
 
 
 # ===================== FILTER BANK =====================
@@ -375,7 +399,8 @@ def _leq_average(leq_array_db: np.ndarray, n: int) -> np.ndarray:
 def octave_leq_analyzer_process(
     raw_queue:    mp.Queue,
     result_queue: mp.Queue,
-    weighting:    str,
+    weighting_a:  str,
+    weighting_c:  str,  
     display_mode: str,
     stat_second:  mp.Value,
     stop_event:   mp.Event,
@@ -394,10 +419,12 @@ def octave_leq_analyzer_process(
     """
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [Analyzer] %(message)s')
     logger = logging.getLogger()
-    logger.info(f"Analyzer started | weighting={weighting} | mode={display_mode}")
+    #logger.info(f"Analyzer started | weighting={weighting} | mode={display_mode}")
+    logger.info(f"Analyzer started | All weighting | mode={display_mode}")
 
     filter_bank          = OctaveFilterBank(SAMPLE_RATE, OCTAVE_FRACTION, OCTAVE_ORDER, FREQ_LIMITS)
-    weighting_corrections = WEIGHTING_DICT[weighting]
+    weighting_corrections_a = WEIGHTING_DICT[weighting_a]
+    weighting_corrections_c = WEIGHTING_DICT[weighting_c]
     n_bands              = len(filter_bank.freq)
 
     # ── Per-second accumulation (always active) ───────────────────────────
@@ -425,13 +452,17 @@ def octave_leq_analyzer_process(
             continue
 
         # ── ngekalibrasi  ───────
+        #raw_samples = np.frombuffer(packet['raw_samples'], dtype=np.float32) #optimze delay 2
         raw_samples = packet['raw_samples']
         calib       = packet['calib']
         samples     = raw_samples * calib   # ini kalibrasinya
-
+        #samples     = raw_samples
         current_lat  = packet['lat']
         current_lon  = packet['lon']
         current_batt = packet['batt']
+
+        # Add this temporarily to the analyzer, right after samples = raw_samples * calib:
+        print(f"calib={calib} rms={np.sqrt(np.mean(samples**2)):.1f} max={np.max(np.abs(samples)):.1f}")
 
         # Accumulate 8 packets → 1 second of audio
         start_idx = packet_counter * SAMPLES_SHORT
@@ -442,12 +473,20 @@ def octave_leq_analyzer_process(
             continue
 
         # ── 1-second Leq calculation ──────────────────────────────────────
-        leq_bands_raw      = filter_bank.filter_signal_to_leq_bands(all_samples)
-        leq_bands_weighted = leq_bands_raw + weighting_corrections
+        # ini khusus untuk tiap bandnya
+        leq_bands_raw      = filter_bank.filter_signal_to_leq_bands(all_samples) # ini rawnya
+        leq_bands_weighted_a = leq_bands_raw + weighting_corrections_a # ini a-nya 
+        leq_bands_weighted_c = leq_bands_raw + weighting_corrections_c # ini c-nya
 
-        linear_sum_w       = np.sum(10 ** (leq_bands_weighted / 10))
-        leq_total_weighted = 10 * np.log10(linear_sum_w) if linear_sum_w > 1e-10 else 0.0
+        # ini buat yang a
+        linear_sum_w_a       = np.sum(10 ** (leq_bands_weighted_a / 10))
+        leq_total_weighted_a = 10 * np.log10(linear_sum_w_a) if linear_sum_w_a > 1e-10 else 0.0
+        
+        # ini yang buat c
+        linear_sum_w_c       = np.sum(10 ** (leq_bands_weighted_c / 10))
+        leq_total_weighted_c = 10 * np.log10(linear_sum_w_c) if linear_sum_w_c > 1e-10 else 0.0
 
+        # ini yang buat z
         linear_sum_r  = np.sum(10 ** (leq_bands_raw / 10))
         leq_total_raw = 10 * np.log10(linear_sum_r) if linear_sum_r > 1e-10 else 0.0
 
@@ -459,12 +498,13 @@ def octave_leq_analyzer_process(
         # ── Dispatch to publisher ─────────────────────────────────────────
         if display_mode == 'second':
             result = {
-                'leq_total_weighted':  float(leq_total_weighted),
-                'leq_total_raw':       float(leq_total_raw),
-                'leq_bands_weighted':  leq_bands_weighted.tolist(),
+                'leq_total_weighted_a':  float(leq_total_weighted_a),
+                'leq_total_weighted_c':  float(leq_total_weighted_c),
+                'leq_total_raw':         float(leq_total_raw),
+                #'leq_bands_weighted':  leq_bands_weighted.tolist(),
                 'leq_bands_raw':       leq_bands_raw.tolist(),
                 'freq_bands':          filter_bank.freq,
-                'weighting':           weighting,
+                #'weighting':           weighting,
                 'display_mode':        'second',
                 'timestamp':           timestamp,
                 'lat':                 float(current_lat),
@@ -483,7 +523,8 @@ def octave_leq_analyzer_process(
             # Store per-second values.
             minute_buffer_bands[minute_second_idx]          = leq_bands_raw
             minute_buffer_total_raw[minute_second_idx]      = leq_total_raw
-            minute_buffer_total_weighted[minute_second_idx] = leq_total_weighted
+            minute_buffer_total_weighted_a[minute_second_idx] = leq_total_weighted_a
+            minute_buffer_total_weighted_c[minute_second_idx] = leq_total_weighted_c
             minute_second_idx += 1
 
             if minute_second_idx >= SECONDS_PER_MINUTE:
@@ -491,20 +532,24 @@ def octave_leq_analyzer_process(
 
                 # Leq 1-minute per band (raw), then weighted
                 leq_1min_bands_raw      = _leq_average(minute_buffer_bands, SECONDS_PER_MINUTE)
-                leq_1min_bands_weighted = leq_1min_bands_raw + weighting_corrections
+                leq_1min_bands_weighted_a = leq_1min_bands_raw + weighting_corrections_a
+                leq_1min_bands_weighted_c = leq_1min_bands_raw + weighting_corrections_c
 
                 # Leq 1-minute total (raw and weighted)
             
                 leq_1min_total_raw      = float(_leq_average(minute_buffer_total_raw,      SECONDS_PER_MINUTE))
-                leq_1min_total_weighted = float(_leq_average(minute_buffer_total_weighted, SECONDS_PER_MINUTE))
+                leq_1min_total_weighted_a = float(_leq_average(minute_buffer_total_weighted_a, SECONDS_PER_MINUTE))
+                leq_1min_total_weighted_c = float(_leq_average(minute_buffer_total_weighted_c, SECONDS_PER_MINUTE))
 
                 result = {
-                    'leq_total_weighted':  leq_1min_total_weighted,
+                    'leq_total_weighted_a':  leq_1min_total_weighted_a,
+                    'leq_total_weighted_c':  leq_1min_total_weighted_c,
                     'leq_total_raw':       leq_1min_total_raw,
-                    'leq_bands_weighted':  leq_1min_bands_weighted.tolist(),
+                    #'leq_bands_weighted_a':  leq_1min_bands_weighted_a.tolist(),
+                    #'leq_bands_weighted_c':  leq_1min_bands_weighted_c.tolist(),
                     'leq_bands_raw':       leq_1min_bands_raw.tolist(),
                     'freq_bands':          filter_bank.freq,
-                    'weighting':           weighting,
+                    #'weighting':           weighting,
                     'display_mode':        'minute',
                     'timestamp':           timestamp,
                     'lat':                 float(last_lat),
@@ -524,7 +569,8 @@ def octave_leq_analyzer_process(
                 minute_second_idx = 0
                 minute_buffer_bands[:]          = 0.0
                 minute_buffer_total_raw[:]      = 0.0
-                minute_buffer_total_weighted[:] = 0.0
+                minute_buffer_total_weighted_a[:] = 0.0
+                minute_buffer_total_weighted_c[:] = 0.0
 
         # Reset second accumulation
         packet_counter = 0
@@ -577,9 +623,11 @@ def publisher_process(
         except Exception:
             continue
 
-        w    = result['weighting']
+        #w    = result['weighting']
         ts   = result['timestamp']
-        leq_w = result['leq_total_weighted']
+        leq_w = result['leq_total_raw']
+        leq_w_a = result['leq_total_weighted_a']
+        leq_w_c = result['leq_total_weighted_c']
         label = result['label']
         mode  = result['display_mode']
         unit  = "minute" if mode == 'minute' else "second"
@@ -587,7 +635,8 @@ def publisher_process(
         calibration = result['gain']
 
         #print(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit})  batt={batt:.1f}%")
-        logger.info(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit})  batt={batt:.1f}% gain={calibration}")
+        #logger.info(f"[{ts}] {label}: L{w}eq = {leq_w:.1f} dB{w}  ({unit})  batt={batt:.1f}% gain={calibration}")
+        logger.info(f"[{ts}] {label}: Leq = {leq_w:.1f} dBZ {leq_w_a:.1f} dBA {leq_w_c:.1f} dBC ({unit})  batt={batt:.1f}% gain={calibration}")
 
         sec = result['second']
         if sec in plot_seconds_set and sec not in plotted_seconds:
@@ -605,7 +654,8 @@ def publisher_process(
         
         data_kebisingan = {}
         data_kebisingan['no_dev'] = "dev_001"
-        data_kebisingan['leq_total_weighted'] = result['leq_total_weighted']
+        data_kebisingan['leq_total_weighted_a'] = result['leq_total_weighted_a']
+        data_kebisingan['leq_total_weighted_c'] = result['leq_total_weighted_c']
         data_kebisingan['leq_total'] = result['leq_total_raw'] # ini perlu dikirim kah?
         data_kebisingan['lat'] = result['lat']
         data_kebisingan['lon'] = result['lon']
@@ -632,10 +682,12 @@ def publisher_process(
 def _plot_result(result, nominal_labels, logger):
     """Saves a 1/3-octave bar chart PNG for a given result dict."""
     try:
-        leq_bands_weighted = result['leq_bands_weighted'] # tinggal ganti leq_bands_raw kalau mau tampilin yang raw
-        leq_total_weighted = result['leq_total_weighted']
+        leq_bands_weighted = result['leq_bands_raw'] # tinggal ganti leq_bands_raw kalau mau tampilin yang raw
+        leq_total_raw        = result['leq_total_raw']
+        leq_total_weighted_a = result['leq_total_weighted_a']
+        leq_total_weighted_c = result['leq_total_weighted_c']
         freq_bands         = result['freq_bands']
-        w                  = result['weighting']
+        #w                  = result['weighting']
         label              = result['label']
         mode               = result['display_mode']
 
@@ -657,20 +709,22 @@ def _plot_result(result, nominal_labels, logger):
         ax.set_xticks(x_pos)
         ax.set_xticklabels(freq_labels, rotation=45, ha='right', fontsize=10)
         ax.set_xlabel('Frequency (Hz)', fontsize=12, fontweight='bold')
-        ax.set_ylabel(f'L{w}eq (dB{w})', fontsize=12, fontweight='bold')
+        ax.set_ylabel(f'LZzeq (dBZ)', fontsize=12, fontweight='bold')
 
         duration_str = "1-minute" if mode == 'minute' else "1-second"
         ax.set_title(
-            f'1/3 Octave Band L{w}eq [{duration_str}] [{label}]\n'
-            f'L{w}eq_total = {leq_total_weighted:.1f} dB{w}',
-            fontsize=14, fontweight='bold',
+            f'1/3 Octave Band LZeq [{duration_str}] [{label}]\n'
+            f'LZeq_total = {leq_total_raw:.1f} dBz'
+            f'LAeq_total = {leq_total_weighted_a:.1f} dBA'
+            f'LCeq_total = {leq_total_weighted_c:.1f} dBC',
+            fontsize=14, fontweight='bold'
         )
         ax.set_ylim(20, 125)
         ax.grid(True, alpha=0.3, axis='y', linestyle='--')
         plt.tight_layout()
 
         sec      = result['second']
-        filename = f'leq_{w}_{mode}_s{sec}.png'
+        filename = f'leq_{mode}_s{sec}.png'
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         logger.info(f"Plot saved: {filename}")
         plt.close(fig)
@@ -682,7 +736,7 @@ def _plot_result(result, nominal_labels, logger):
 
 # ===================== MAIN =====================
 def main():
-    mp.set_start_method('fork')
+    mp.set_start_method('spawn') #optimize 3
 
     logging.basicConfig(
         level=logging.INFO,
@@ -692,7 +746,8 @@ def main():
 
     logger.info("=" * 70)
     logger.info("Noise Monitoring - Multiprocessing + Display Mode")
-    logger.info(f"Weighting    : {WEIGHTING}-weighting")
+    # logger.info(f"Weighting    : {WEIGHTING}-weighting")
+    logger.info(f"Weighting    : All Weighting")
     logger.info(f"Display Mode : {DISPLAY_MODE}")
     logger.info(f"CPU cores    : {mp.cpu_count()}")
     logger.info(f"Frame size   : {FRAME_SIZE} bytes")
@@ -724,7 +779,7 @@ def main():
     )
     p_analyzer = mp.Process(
         target=octave_leq_analyzer_process,
-        args=(raw_queue, result_queue, WEIGHTING, DISPLAY_MODE,
+        args=(raw_queue, result_queue, WEIGHTING_A, WEIGHTING_C, DISPLAY_MODE,
               stat_second, stop_event),
         name="OctaveAnalyzer",
         daemon=True,
