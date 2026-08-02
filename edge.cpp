@@ -1,44 +1,33 @@
 /**
- * =============================================================================
+
  * ESP32-S3 (Super-Loop / Single Core Architecture)
- * Audio Streaming + GPS + Calibration + INA219 Battery Monitor
- * =============================================================================
- *
- * ARCHITECTURE CHANGES:
- *   • Removed FreeRTOS tasks (audioDSPTask, systemTask), Queues, and Mutexes.
- *   • Removed atomic variables (no longer needed for single-thread).
- *   • Everything runs synchronously in the main Arduino loop().
- *   • I2S reads directly, processes, checks system state, and writes to USB sequentially.
- * =============================================================================
+ * Audio Streaming + Calibration + INA219 Battery Monitor (Coulomb Counting)
  */
 
-#include <HardwareSerial.h>
 #include <TinyGPS++.h>
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <Preferences.h>
 #include "sos-iir-filter.h"
-
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 
 /* ─── I2C ────────────────────────────────────────────────────────────────── */
 #define I2C_SDA 4 
 #define I2C_SCL 5 
-
-Adafruit_INA219 ina219;            
+Adafruit_INA219 ina219;
 
 /* ─── AUDIO CONFIG ───────────────────────────────────────────────────────── */
 #define SAMPLE_RATE    48000
 #define SAMPLE_BITS    32
 #define MIC_BITS       24
-#define SAMPLES_SHORT  (SAMPLE_RATE / 8)          // 125 ms = 6000 samples
+#define SAMPLES_SHORT  (SAMPLE_RATE / 8)   // 125ms = 6000 samples
 #define MIC_CONVERT(s) (s >> (SAMPLE_BITS - MIC_BITS))
 
 /* ─── I2S PINS ───────────────────────────────────────────────────────────── */
 #define I2S_WS   9
 #define I2S_SCK  39
-#define I2S_SD   15    
+#define I2S_SD   15
 #define I2S_PORT I2S_NUM_0
 
 /* ─── GPS ────────────────────────────────────────────────────────────────── */
@@ -55,14 +44,16 @@ Adafruit_INA219 ina219;
 #define BTN_DOWN 10
 
 /* ─── TIMING ─────────────────────────────────────────────────────────────── */
-#define HOLD_DURATION_MS    2000   
-#define NVS_SAVE_DELAY_MS   8000   
-#define SAVE_NOTIFY_MS      1500   
-#define BATTERY_INTERVAL_MS 1000   
+#define HOLD_DURATION_MS    2000
+#define NVS_SAVE_DELAY_MS   8000
+#define SAVE_NOTIFY_MS      1500
+#define BATTERY_INTERVAL_MS 1000
 
-/* ─── BATTERY SPEC (3S LiPo 12 V nominal) ───────────────────────────────── */
-#define BATT_V_MAX  12.6f
-#define BATT_V_MIN   9.6f
+/* ─── BATTERY SPEC (Coulomb Counting) ────────────────────────────────────── */
+// const float ENERGI_TOTAL_Wh = 111.0;
+const float ENERGI_TOTAL_Wh =  87.759;
+float energiTerpakai_Wh = 0.0;
+float kapasitasTerpakai_mAh = 0.0;
 
 /* ─── MODE ENUM ──────────────────────────────────────────────────────────── */
 enum class DeviceMode : uint8_t {
@@ -77,35 +68,65 @@ TinyGPSPlus    gps;
 HardwareSerial gpsSerial(1);
 Preferences    preferences;
 
-// Single-thread state variables
-DeviceMode deviceMode = DeviceMode::STREAMING;
+DeviceMode deviceMode        = DeviceMode::STREAMING;
 float      currentCalibration = 1.0f;
 
-/* --- USB packet ----------------------------------------------------------- */
+/* ─── USB PACKET ─────────────────────────────────────────────────────────── */
 typedef struct __attribute__((packed)) {
     uint32_t timestamp_ms;
     float    latitude;
     float    longitude;
-    float    calibration_multiplier;   
-    float    battery_percentage;      
+    float    calibration_multiplier;
+    float    battery_percentage;
+    float    calibration_mode;
     float    samples[SAMPLES_SHORT];
 } usb_packet_t;
 
 static usb_packet_t usb_packet;
-
-// Raw buffer for I2S read
 static int32_t raw_i2s_buffer[SAMPLES_SHORT] __attribute__((aligned(4)));
 
 /* ─── IIR FILTERS ────────────────────────────────────────────────────────── */
 SOS_IIR_Filter DC_BLOCKER = {
     1.0,
-    { {-1.0, 0.0, 0.9992, 0} }
+    { {-1.0, 0.0, 0.999975, 0} }   // cutoff ~0.19Hz — removes DC + sub-Hz drift
 };
+
+// Option 1b: ~20 Hz cutoff — good balance, noise at 20Hz band drops ~8 dB
+// SOS_IIR_Filter DC_BLOCKER = {
+//     1.0, { {-1.0, 0.0, 0.997383, 0} }
+// };
+
+// SOS_IIR_Filter DC_BLOCKER = {
+//     1.0, { {-1.0, 0.0, 0.993446, 0} }
+// };
+
+// ini default
+// SOS_IIR_Filter INMP441 = {
+//     1.00197834654696,
+//     { {-1.986920458344451, 0.986963226946616,
+//        1.995178510504166, -0.995184322194091} }
+// };
+
 SOS_IIR_Filter INMP441 = {
-    1.00197834654696,
-    { {-1.986920458344451, 0.986963226946616,
-       1.995178510504166, -0.995184322194091} }
+    1.002293656656743,
+    { { -1.984311050946219, 0.984433168289200,
+        1.988892905899653, -0.988954249933127 } }
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FILTER RESET
+   ═══════════════════════════════════════════════════════════════════════════ */
+void resetFilters() {
+    for (int i = 0; i < DC_BLOCKER.num_sos; i++) {
+        DC_BLOCKER.w[i].w0 = 0.0f;
+        DC_BLOCKER.w[i].w1 = 0.0f;
+    }
+    for (int i = 0; i < INMP441.num_sos; i++) {
+        INMP441.w[i].w0 = 0.0f;
+        INMP441.w[i].w1 = 0.0f;
+    }
+    i2s_zero_dma_buffer(I2S_PORT);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    I2S INIT
@@ -125,41 +146,33 @@ void mic_i2s_init() {
         .fixed_mclk        = 0
     };
     i2s_pin_config_t pins = {
-        .bck_io_num    = I2S_SCK,
-        .ws_io_num     = I2S_WS,
-        .data_out_num  = I2S_PIN_NO_CHANGE,
-        .data_in_num   = I2S_SD
+        .bck_io_num   = I2S_SCK,
+        .ws_io_num    = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num  = I2S_SD
     };
     i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
     i2s_set_pin(I2S_PORT, &pins);
 }
 
-// Safety function to send dta
-void send_all_bytes(uint8_t* data, size_t total_length) {
-    size_t bytes_written = 0;
-    while (bytes_written < total_length) {
-        size_t w = Serial.write(data + bytes_written, total_length - bytes_written);
-        if (w == 0) {
-            delay(1); 
-        } else {
-            bytes_written += w;
-        }
-    }
+/* ═══════════════════════════════════════════════════════════════════════════
+   RESET COULOMB COUNTING
+   ═══════════════════════════════════════════════════════════════════════════ */
+void resetCoulombCounting() {
+    energiTerpakai_Wh = 0.0;
+    kapasitasTerpakai_mAh = 0.0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    SETUP
    ═══════════════════════════════════════════════════════════════════════════ */
 void setup() {
-    Serial.setTxBufferSize(32768); 
+    Serial.setTxBufferSize(32768);
     Serial.begin(115200);
-    setCpuFrequencyMhz(240);
+    setCpuFrequencyMhz(80); // mungkin karena dia cuma 80mhz
 
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!ina219.begin()) {
-        // Serial.println("INA219 Not Found.");
-    }
-
+    Wire.begin(I2C_SDA, I2C_SCL);     
+    ina219.begin();  
     pinMode(BTN_UP,   INPUT_PULLUP);
     pinMode(BTN_DOWN, INPUT_PULLUP);
 
@@ -167,98 +180,63 @@ void setup() {
     currentCalibration = preferences.getFloat("multiplier", 1.0f);
 
     mic_i2s_init();
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   MAIN LOOP (Synchronous Super-Loop)
+   MAIN LOOP
    ═══════════════════════════════════════════════════════════════════════════ */
 void loop() {
-    static float         battVoltage    = 0.0f;
-    static float         battCurrent_mA = 0.0f;
-    static float         battPercent    = 0.0f;
-    static float         mAh_used       = 0.0f;
-    static unsigned long battLastMs     = millis();
+    static float         battPercent     = 100.0f; // Default assume full
+    static unsigned long battLastMs      = millis();
 
-    static bool          lastUp         = HIGH;
-    static bool          lastDown       = HIGH;
-    static unsigned long bothPressStart = 0;
-    static bool          holdFired      = false;
+    static bool          lastUp          = HIGH;
+    static bool          lastDown        = HIGH;
+    static unsigned long bothPressStart  = 0;
+    static bool          holdFired       = false;
 
-    static bool          calibChanged   = false;
-    static unsigned long lastSaveMs     = 0;
-    static unsigned long saveNotifyEnd  = 0;
+    static bool          calibChanged    = false;
+    static unsigned long lastSaveMs      = 0;
+    static unsigned long saveNotifyEnd   = 0;
 
-    unsigned long now = millis();
+    static bool          lastUsbConnected = false;
+    static bool          warmupDone       = false;  // ← one-shot guard
 
-    // =========================================================================
-    // 1. AUDIO ACQUISITION & DSP (Blocks until 125ms of data is ready)
-    // =========================================================================
-    size_t bytes_read = 0;
-    i2s_read(I2S_PORT, raw_i2s_buffer, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
-
-    // Convert directly into the USB packet struct to save memory
-    for (int i = 0; i < SAMPLES_SHORT; i++) {
-        usb_packet.samples[i] = static_cast<float>(MIC_CONVERT(raw_i2s_buffer[i]));
-    }
-
-    DC_BLOCKER.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
-    INMP441.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+    unsigned long now          = millis();
+    bool          usbConnected = (bool)Serial;
 
     // =========================================================================
-    // 2. SYSTEM LOGIC (Battery, Buttons, GPS, NVS)
+    // BUTTON & CALIBRATION LOGIC FIRST — before any blocking calls
     // =========================================================================
-    
-    // -- Battery Monitor --
-    if (now - battLastMs >= BATTERY_INTERVAL_MS) {
-        unsigned long elapsed_ms = now - battLastMs;
-        battLastMs = now;
-        
-        battVoltage    = ina219.getBusVoltage_V();
-        battCurrent_mA = ina219.getCurrent_mA();
-        mAh_used      += battCurrent_mA * (elapsed_ms / 3600000.0f);
+    bool upPressed   = (digitalRead(BTN_UP)   == LOW);
+    bool downPressed = (digitalRead(BTN_DOWN) == LOW);
+    bool isCalib     = (deviceMode == DeviceMode::CALIBRATING);
 
-        // Dummy data options (e.g., a healthy 11.4V drawing 250mA)
-        //battVoltage    = 11.4f;  
-        //battCurrent_mA = 250.0f;
-
-        battPercent = ((battVoltage - BATT_V_MIN) / (BATT_V_MAX - BATT_V_MIN)) * 100.0f;
-        if (battPercent > 100.0f) battPercent = 100.0f;
-        if (battPercent < 0.0f)   battPercent = 0.0f;
-    }
-
-    // -- Button State --
-    bool upPressed    = (digitalRead(BTN_UP)   == LOW);
-    bool downPressed  = (digitalRead(BTN_DOWN) == LOW);
-    bool isCalib      = (deviceMode == DeviceMode::CALIBRATING);
-
-    // Hold both buttons
+    // Hold both buttons to toggle mode
     if (upPressed && downPressed) {
         if (bothPressStart == 0) {
             bothPressStart = now;
             holdFired      = false;
         } else if (!holdFired && (now - bothPressStart >= HOLD_DURATION_MS)) {
-            holdFired = true;
+            holdFired  = true;
             deviceMode = isCalib ? DeviceMode::STREAMING : DeviceMode::CALIBRATING;
-            isCalib = (deviceMode == DeviceMode::CALIBRATING);
+            isCalib    = (deviceMode == DeviceMode::CALIBRATING);
         }
     } else {
         bothPressStart = 0;
         holdFired      = false;
     }
 
-    // Single edge detection for Calibration
     if (isCalib) {
         bool upEdge   = (lastUp   == LOW && !upPressed);
         bool downEdge = (lastDown == LOW && !downPressed);
 
         if (upEdge && !downPressed) {
-            currentCalibration += 0.25f;
+            currentCalibration += 0.0625f;
             calibChanged  = true;
             saveNotifyEnd = 0;
         }
         if (downEdge && !upPressed) {
-            currentCalibration -= 0.25f;
+            currentCalibration -= 0.0625f;
             if (currentCalibration < 0.0f) currentCalibration = 0.0f;
             calibChanged  = true;
             saveNotifyEnd = 0;
@@ -274,34 +252,91 @@ void loop() {
         lastSaveMs   = now;
         if (isCalib) saveNotifyEnd = now + SAVE_NOTIFY_MS;
     }
-
     if (saveNotifyEnd != 0 && now >= saveNotifyEnd) {
         saveNotifyEnd = 0;
     }
 
-    // -- GPS Feed --
-    while (gpsSerial.available()) {
-        gps.encode(gpsSerial.read());
+    // =========================================================================
+    // USB RECONNECT: reset filters + warmup (one-shot per connection)
+    // =========================================================================
+    if (usbConnected && !lastUsbConnected) {
+        warmupDone = false;  // new connection → allow warmup once
+    }
+    lastUsbConnected = usbConnected;
+
+    if (usbConnected && !warmupDone) {
+        resetFilters();
+        for (int warmup = 0; warmup < 4; warmup++) {
+            size_t dummy;
+            i2s_read(I2S_PORT, raw_i2s_buffer,
+                     SAMPLES_SHORT * sizeof(int32_t), &dummy, portMAX_DELAY);
+            for (int i = 0; i < SAMPLES_SHORT; i++)
+                usb_packet.samples[i] = static_cast<float>(MIC_CONVERT(raw_i2s_buffer[i]));
+            INMP441.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+            DC_BLOCKER.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+        }
+        warmupDone = true;  // ← never runs again until next disconnect+reconnect
+    }
+
+    // =========================================================================
+    // 1. AUDIO ACQUISITION & DSP
+    // =========================================================================
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, raw_i2s_buffer,
+             SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
+    for (int i = 0; i < SAMPLES_SHORT; i++) {
+        usb_packet.samples[i] = static_cast<float>(MIC_CONVERT(raw_i2s_buffer[i]));
+    }
+
+    INMP441.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+    DC_BLOCKER.filter(usb_packet.samples, usb_packet.samples, SAMPLES_SHORT);
+
+    // =========================================================================
+    // 2. BATTERY MONITOR (Coulomb Counting Integration)
+    // =========================================================================
+    if (now - battLastMs >= BATTERY_INTERVAL_MS) {
+        unsigned long elapsed_ms = now - battLastMs;
+        battLastMs = now; // update timer
+
+        float tegangan_V = ina219.getBusVoltage_V();
+        float arus_mA    = ina219.getCurrent_mA();
+        
+        float arus_A      = arus_mA / 1000.0f;
+        float daya_W      = tegangan_V * arus_A;
+        float selisih_jam = elapsed_ms / 3600000.0f;
+        
+        float energiSesi_Wh     = daya_W * selisih_jam;
+        float kapasitasSesi_mAh = arus_mA * selisih_jam;
+        
+        energiTerpakai_Wh     += energiSesi_Wh;
+        kapasitasTerpakai_mAh += kapasitasSesi_mAh;
+        
+        if (energiTerpakai_Wh < 0.0f) energiTerpakai_Wh = 0.0f;
+        if (energiTerpakai_Wh > ENERGI_TOTAL_Wh) energiTerpakai_Wh = ENERGI_TOTAL_Wh;
+        
+        battPercent = 100.0f - (energiTerpakai_Wh / ENERGI_TOTAL_Wh) * 100.0f;
+        
+        // Clamp the percentage strictly between 0 and 100
+        if (battPercent > 100.0f) battPercent = 100.0f;
+        if (battPercent < 0.0f)   battPercent = 0.0f;
     }
 
     // =========================================================================
     // 3. USB CDC STREAMING
     // =========================================================================
     usb_packet.timestamp_ms           = now;
-    usb_packet.latitude               = gps.location.lat();
-    usb_packet.longitude              = gps.location.lng();
+    usb_packet.latitude               = 0.0f;
+    usb_packet.longitude              = 0.0f;
+    // usb_packet.latitude               = gps.location.lat();
+    // usb_packet.longitude              = gps.location.lng();
     usb_packet.calibration_multiplier = currentCalibration;
     usb_packet.battery_percentage     = battPercent;
-
+    usb_packet.calibration_mode       = static_cast<uint8_t>(deviceMode);
     uint32_t sm = FRAME_START_MARKER;
     uint32_t em = FRAME_END_MARKER;
-    
-    Serial.write(reinterpret_cast<uint8_t *>(&sm), 4);
-    Serial.write(reinterpret_cast<uint8_t *>(&usb_packet), sizeof(usb_packet_t));
-    Serial.write(reinterpret_cast<uint8_t *>(&em), 4);
 
-    // Opsi makai fungsi send all bytes (safety option)
-    // send_all_bytes(reinterpret_cast<uint8_t*>(&sm), 4);
-    // send_all_bytes(reinterpret_cast<uint8_t*>(&usb_packet), sizeof(usb_packet_t));
-    // send_all_bytes(reinterpret_cast<uint8_t*>(&em), 4);
+    Serial.write(reinterpret_cast<uint8_t*>(&sm), 4);
+    Serial.write(reinterpret_cast<uint8_t*>(&usb_packet), sizeof(usb_packet_t));
+    Serial.write(reinterpret_cast<uint8_t*>(&em), 4);
 }
